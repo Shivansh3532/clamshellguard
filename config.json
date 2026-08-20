@@ -1,0 +1,7 @@
+{
+  "PollMilliseconds": 1000,
+  "DisconnectDebounceMilliseconds": 4500,
+  "AutoSuspendWhenNoDisplays": true,
+  "IncludeWirelessDisplays": true,
+  "LogMaxBytes": 1048576
+}
