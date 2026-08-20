@@ -7,17 +7,19 @@ $ErrorActionPreference = 'Stop'
 
 . (Join-Path $PSScriptRoot 'Core.ps1')
 
-$DataDir = Join-Path $Root 'data'
-$LogDir = Join-Path $Root 'logs'
+$userSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+$DataDir = Join-Path (Join-Path $Root 'data') $userSid
+$LogDir = Join-Path (Join-Path $Root 'logs') $userSid
 $ConfigPath = Join-Path $Root 'config.json'
 $StatusPath = Join-Path $DataDir 'status.json'
+$StopPath = Join-Path $Root 'stop.request'
 New-Item -ItemType Directory -Path $DataDir -Force | Out-Null
 New-Item -ItemType Directory -Path $LogDir -Force | Out-Null
 
 $config = [pscustomobject]@{
     PollMilliseconds = 1000
     DisconnectDebounceMilliseconds = 4500
-    AutoSuspendWhenNoDisplays = $true
+    AutoSuspendWhenNoDisplays = $false
     IncludeWirelessDisplays = $true
     LogMaxBytes = 1048576
 }
@@ -46,7 +48,8 @@ function Write-CGLog {
 }
 
 $createdNew = $false
-$mutex = New-Object System.Threading.Mutex($true, 'Global\ClamshellGuard-Agent', [ref]$createdNew)
+$mutexName = 'Local\ClamshellGuard-Agent-' + ($userSid -replace '[^A-Za-z0-9-]','_')
+$mutex = New-Object System.Threading.Mutex($true, $mutexName, [ref]$createdNew)
 if (-not $createdNew) {
     $mutex.Dispose()
     exit 0
@@ -62,11 +65,13 @@ function Write-CGStatus {
     param($Display, $Scheme, [string]$Mode, [string]$Message = '')
     try {
         $lid = $null
-        try { $lid = Get-CGLidValues -SchemeGuid $Scheme } catch { }
+        try { if ($null -ne $Scheme) { $lid = Get-CGLidValues -SchemeGuid $Scheme } } catch { }
         $temp = "$StatusPath.tmp"
         [ordered]@{
-            Version = '1.0.0'
+            Version = '1.1.0'
             TimestampUtc = [DateTime]::UtcNow.ToString('o')
+            User = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+            UserSid = $userSid
             Mode = $Mode
             Message = $Message
             ActiveScheme = if ($null -ne $Scheme) { $Scheme.ToString('D') } else { $null }
@@ -84,10 +89,15 @@ function Write-CGStatus {
     catch { }
 }
 
-Write-CGLog 'Agent starting.'
+Write-CGLog ("Agent starting as {0} ({1})." -f [Security.Principal.WindowsIdentity]::GetCurrent().Name, $userSid)
 
 try {
     while ($true) {
+        if (Test-Path -LiteralPath $StopPath) {
+            Write-CGLog 'Stop request detected.'
+            break
+        }
+
         try {
             $display = Get-CGDisplayState -IncludeWirelessDisplays ([bool]$config.IncludeWirelessDisplays)
             if (-not $display.QuerySucceeded) {
@@ -123,12 +133,18 @@ try {
 
                 [void](Restore-CGManagedPlans -DataDir $DataDir -ExceptScheme $scheme)
                 Enable-CGPlanGuard -DataDir $DataDir -SchemeGuid $scheme
+
+                $verified = Get-CGLidValues -SchemeGuid $scheme
+                if ($verified.AC -ne 0 -or $verified.DC -ne 0) {
+                    throw "Lid policy verification failed after write. AC=$($verified.AC) DC=$($verified.DC)"
+                }
+
                 $managedScheme = $scheme
                 if (-not $guardActive) {
-                    Write-CGLog ("Clamshell mode enabled on plan {0}." -f $scheme)
+                    Write-CGLog ("Clamshell mode enabled and verified on plan {0}." -f $scheme)
                 }
                 $guardActive = $true
-                Write-CGStatus -Display $display -Scheme $scheme -Mode 'CLAMSHELL' -Message 'External display active; lid close is temporarily set to Do nothing.'
+                Write-CGStatus -Display $display -Scheme $scheme -Mode 'CLAMSHELL' -Message 'External display active; lid-close policy is verified as Do nothing.'
             }
             else {
                 if ($guardActive) {
@@ -139,10 +155,9 @@ try {
 
                     $elapsed = ((Get-Date) - $disconnectSince).TotalMilliseconds
                     if ($elapsed -ge [int]$config.DisconnectDebounceMilliseconds) {
-                        $restoredState = $null
                         if ($null -ne $managedScheme) {
                             try {
-                                $restoredState = Restore-CGPlan -DataDir $DataDir -SchemeGuid $managedScheme
+                                [void](Restore-CGPlan -DataDir $DataDir -SchemeGuid $managedScheme)
                                 Write-CGLog ("Restored lid settings for plan {0}." -f $managedScheme)
                             }
                             catch {
@@ -153,16 +168,6 @@ try {
                         $guardActive = $false
                         $managedScheme = $null
                         $disconnectSince = $null
-
-                        if ([bool]$config.AutoSuspendWhenNoDisplays -and $display.ActiveCount -eq 0 -and $null -ne $restoredState) {
-                            Start-Sleep -Milliseconds 1500
-                            $recheck = Get-CGDisplayState -IncludeWirelessDisplays ([bool]$config.IncludeWirelessDisplays)
-                            if ($recheck.QuerySucceeded -and $recheck.ActiveCount -eq 0) {
-                                $source = Get-CGPowerSource
-                                $action = Invoke-CGOriginalClosedAction -PlanState $restoredState -PowerSource $source
-                                Write-CGLog ("No displays remained after debounce; original closed-lid action requested: {0}." -f $action)
-                            }
-                        }
                     }
                 }
                 else {
@@ -174,12 +179,25 @@ try {
         }
         catch {
             Write-CGLog $_.Exception.ToString() 'ERROR'
+            try {
+                $schemeForError = Get-CGActiveSchemeGuid
+                $failedDisplay = [pscustomobject]@{ QuerySucceeded=$false; Error=$_.Exception.Message; ActiveCount=0; ExternalCount=0; InternalCount=0; Monitors=@() }
+                Write-CGStatus -Display $failedDisplay -Scheme $schemeForError -Mode 'ERROR' -Message $_.Exception.Message
+            }
+            catch { }
         }
 
         Start-Sleep -Milliseconds ([Math]::Max(500, [int]$config.PollMilliseconds))
     }
 }
 finally {
+    try {
+        [void](Restore-CGManagedPlans -DataDir $DataDir)
+        Write-CGLog 'Restored managed power plans before exit.'
+    }
+    catch {
+        Write-CGLog ("Final restore failed: {0}" -f $_.Exception.Message) 'ERROR'
+    }
     Write-CGLog 'Agent exiting.'
     try { $mutex.ReleaseMutex() } catch { }
     $mutex.Dispose()
