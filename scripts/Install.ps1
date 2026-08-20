@@ -51,7 +51,7 @@ foreach ($existingRoot in @((Join-Path $env:ProgramData 'ClamshellGuard'), (Join
             & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File (Join-Path $existingRoot 'src\Restore.ps1') -Root $existingRoot | Out-Host
         }
         catch {
-            Write-Warning "Could not restore a previous install at $existingRoot: $($_.Exception.Message)"
+            Write-Warning "Could not restore a previous install at ${existingRoot}: $($_.Exception.Message)"
         }
     }
 }
