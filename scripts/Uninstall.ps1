@@ -23,7 +23,7 @@ foreach ($root in $roots) {
     $restore = Join-Path $root 'src\Restore.ps1'
     if (Test-Path -LiteralPath $restore) {
         try { & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $restore -Root $root | Out-Host }
-        catch { Write-Warning "Restore failed at $root: $($_.Exception.Message)" }
+        catch { Write-Warning "Restore failed at ${root}: $($_.Exception.Message)" }
     }
 }
 
